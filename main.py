@@ -1,22 +1,149 @@
 import sys
 import os
 import re
+import time
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget,
                              QFileDialog, QTextBrowser, QLineEdit, QPushButton,
                              QTreeView, QTabWidget, QSplitter, QLabel,
-                             QCompleter, QMessageBox)
-from PyQt6.QtGui import QAction, QFileSystemModel, QColor, QTextCursor, QKeySequence, QShortcut
+                             QCompleter, QMessageBox, QProgressBar)
+from PyQt6.QtGui import QAction, QFileSystemModel, QColor, QFont, QKeySequence
 from PyQt6.QtCore import Qt, QDir, QStringListModel, QThread, pyqtSignal, QProcess
 
 from PyQt6.Qsci import QsciScintilla, QsciLexerPython, QsciLexerJavaScript
 
-# Импорты (rag_engine.py должен лежать рядом)
+# Импорты модулей (должны лежать рядом)
+import llm_client
 from llm_client import get_chat_response, build_context_prompt, API_KEY
 from rag_engine import ProjectIndexer
 
 
-# --- Worker ---
+# ==========================================
+# 1. АГЕНТ-ВОРКЕР (МОЗГ: ПЛАНИРОВАНИЕ + ИСПОЛНЕНИЕ)
+# ==========================================
+class AgentWorker(QThread):
+    """
+    Этот поток реализует цикл:
+    1. Получить План (JSON).
+    2. Показать План.
+    3. Для каждого шага: Поиск в RAG -> Генерация кода -> Сохранение файлов.
+    """
+    log_signal = pyqtSignal(str)  # Отправка HTML в чат
+    finished_signal = pyqtSignal()  # Сигнал завершения
+
+    def __init__(self, user_request, project_path, rag_engine):
+        super().__init__()
+        self.request = user_request
+        self.path = project_path
+        self.rag_engine = rag_engine
+
+    def run(self):
+        # --- ФАЗА 1: ПЛАНИРОВАНИЕ ---
+        self.log_signal.emit(f"""
+        <div style='background:#2d2d2d; border-left:4px solid #a371f7; padding:10px; margin:10px 0;'>
+            <b>🧠 PLANNING PHASE:</b> <i style='color:#ccc'>Thinking about architecture...</i>
+        </div>
+        """)
+
+        # Вызов Стратега из llm_client
+        plan_data = llm_client.get_strategic_plan(self.request)
+
+        steps = plan_data.get("steps", [])
+        proj_name = plan_data.get("project_name", "Project")
+
+        if not steps:
+            self.log_signal.emit(
+                f"<span style='color:red'>Failed to generate plan. Error: {plan_data.get('error')}</span>")
+            self.finished_signal.emit()
+            return
+
+        # Визуализация плана
+        steps_html = "".join([f"<li style='margin-bottom:5px;'>{step}</li>" for step in steps])
+        self.log_signal.emit(f"""
+        <div style='border:1px solid #444; background:#1e1e1e; padding:10px; margin:10px 0; border-radius:5px;'>
+            <h3 style='color:#a371f7; margin-top:0;'>📋 STRATEGY: {proj_name}</h3>
+            <ul style='color:#ccc; padding-left:20px;'>{steps_html}</ul>
+        </div>
+        """)
+
+        # --- ФАЗА 2: ВЫПОЛНЕНИЕ ПО ШАГАМ ---
+        total_steps = len(steps)
+        for i, step in enumerate(steps):
+            step_num = i + 1
+            self.log_signal.emit(
+                f"<hr><div style='color:#61afef'><b>🚀 EXECUTING PHASE {step_num}/{total_steps}:</b><br><i>{step}</i></div>")
+
+            # 1. RAG ПОИСК (Чтение памяти проекта)
+            rag_context = []
+            if self.rag_engine.is_indexed:
+                # Ищем код, связанный с текущей задачей, чтобы не дублировать и не ломать
+                rag_context = self.rag_engine.search(step, top_k=4)
+                if rag_context:
+                    self.log_signal.emit(
+                        f"<small style='color:#666'>🔍 Reading {len(rag_context)} related code blocks...</small>")
+
+            # 2. ГЕНЕРАЦИЯ КОДА (Вызов Исполнителя)
+            response_text = llm_client.execute_step(step, self.request, rag_context)
+
+            # 3. СОХРАНЕНИЕ ФАЙЛОВ
+            files_changed = self.process_files(response_text)
+
+            if not files_changed:
+                self.log_signal.emit("<span style='color:gray; font-size:10px;'>No files modified in this step.</span>")
+
+            # Пауза, чтобы не перегрузить API Google
+            time.sleep(2)
+
+        self.log_signal.emit("<br><br><b style='color:#98c379'>✅ MISSION COMPLETE!</b>")
+        self.finished_signal.emit()
+
+    def process_files(self, text):
+        """Парсит ответ, ищет блоки ### FILE и сохраняет их."""
+        pattern = re.compile(r"### FILE: (.*?)\n(.*?)### END_FILE", re.DOTALL)
+        matches = list(pattern.finditer(text))
+
+        if not matches:
+            return False
+
+        for m in matches:
+            fn = m.group(1).strip()
+            content = m.group(2)
+
+            # Очистка от Markdown блоков кода
+            content = content.replace("```python", "").replace("```javascript", "").replace("```html", "").replace(
+                "```", "").strip()
+
+            full_p = os.path.join(self.path, fn)
+
+            try:
+                # Создаем вложенные папки, если их нет
+                os.makedirs(os.path.dirname(full_p), exist_ok=True)
+
+                # Проверяем статус (Создан или Обновлен)
+                status = "📝 Updated" if os.path.exists(full_p) else "✨ Created"
+                color = "#e5c07b" if os.path.exists(full_p) else "#98c379"
+
+                # Записываем файл
+                with open(full_p, 'w', encoding='utf-8') as f:
+                    f.write(content)
+
+                # Выводим красивую карточку в чат
+                self.log_signal.emit(f"""
+                <div style='margin-left:15px; border-left:3px solid {color}; padding-left:8px; margin-top:4px; background:#252526;'>
+                    <b style='color:{color}'>{status}:</b> <span style='color:#ddd; font-family:Consolas;'>{fn}</span>
+                </div>
+                """)
+
+            except Exception as e:
+                self.log_signal.emit(f"<span style='color:red'>Error writing {fn}: {e}</span>")
+
+        return True
+
+
+# ==========================================
+# 2. ВСПОМОГАТЕЛЬНЫЕ ВОРКЕРЫ
+# ==========================================
 class IndexerWorker(QThread):
+    """Фоновая индексация проекта для RAG."""
     progress_signal = pyqtSignal(str)
     finished_signal = pyqtSignal(str)
 
@@ -30,7 +157,9 @@ class IndexerWorker(QThread):
         self.finished_signal.emit(res)
 
 
-# --- Editor ---
+# ==========================================
+# 3. ЭЛЕМЕНТЫ UI (РЕДАКТОР, ТЕРМИНАЛ)
+# ==========================================
 class CodeEditor(QsciScintilla):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -57,256 +186,191 @@ class CodeEditor(QsciScintilla):
             self.setLexer(None)
 
 
-# --- Terminal ---
 class TerminalPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         l = QVBoxLayout(self);
         l.setContentsMargins(0, 0, 0, 0);
         l.setSpacing(0)
+        self.console = QTextBrowser()
+        self.console.setStyleSheet("background:#1e1e1e; color:#ccc; border:none; font-family:Consolas; font-size:12px;")
+        l.addWidget(self.console)
+        self.inp = QLineEdit()
+        self.inp.setStyleSheet("background:#252526; color:white; border:none; padding:5px; font-family:Consolas;")
+        self.inp.setPlaceholderText("> Terminal...")
+        self.inp.returnPressed.connect(self.run_cmd);
+        l.addWidget(self.inp)
+        self.proc = QProcess(self);
+        self.proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.proc.readyReadStandardOutput.connect(self.read_out);
+        self.proc.start("cmd.exe")
 
-        self.console_output = QTextBrowser()
-        self.console_output.setStyleSheet(
-            "background:#1e1e1e; color:#d4d4d4; font-family:'Consolas'; border:none; border-top:1px solid #333;")
-        self.console_output.setOpenExternalLinks(True)
-        l.addWidget(self.console_output)
+    def run_cmd(self):
+        cmd = self.inp.text();
+        self.inp.clear()
+        try:
+            self.proc.write((cmd + "\n").encode('cp866'))
+        except:
+            self.proc.write((cmd + "\n").encode('utf-8'))
 
-        self.input_line = QLineEdit()
-        self.input_line.setStyleSheet(
-            "background:#1e1e1e; color:#fff; font-family:'Consolas'; border:none; border-top:1px solid #333; padding:4px;")
-        self.input_line.setPlaceholderText("> Terminal...")
-        self.input_line.returnPressed.connect(self.send_command)
-        l.addWidget(self.input_line)
+    def read_out(self):
+        try:
+            t = self.proc.readAllStandardOutput().data().decode('cp866')
+        except:
+            t = ""
+        self.console.append(t)
 
-        self.process = QProcess(self)
-        self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        self.process.readyReadStandardOutput.connect(self.read_output)
-        self.process.start("cmd.exe")
-
-    def set_working_directory(self, path):
-        if self.process.state() == QProcess.ProcessState.Running:
-            # Меняем диск и папку
+    def set_cwd(self, path):
+        if self.proc.state() == QProcess.ProcessState.Running:
             drive = os.path.splitdrive(path)[0]
-            if drive: self.process.write(f"{drive}\n".encode('cp866'))
-            self.process.write(f"cd \"{path}\"\n".encode('cp866'))
-
-    def send_command(self):
-        cmd = self.input_line.text()
-        if not cmd: return
-        self.input_line.clear()
-        full = cmd + "\n"
-        try:
-            self.process.write(full.encode('cp866'))
-        except:
-            self.process.write(full.encode('utf-8'))
-
-    def read_output(self):
-        data = self.process.readAllStandardOutput().data()
-        try:
-            text = data.decode('cp866')
-        except:
-            text = data.decode('utf-8', errors='ignore')
-        c = self.console_output.textCursor();
-        c.movePosition(QTextCursor.MoveOperation.End)
-        c.insertText(text);
-        self.console_output.setTextCursor(c);
-        self.console_output.ensureCursorVisible()
+            if drive: self.proc.write(f"{drive}\n".encode('cp866'))
+            self.proc.write(f"cd \"{path}\"\n".encode('cp866'))
 
 
-# --- Main Window ---
+# ==========================================
+# 4. ГЛАВНОЕ ОКНО
+# ==========================================
 class AIEditorWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cursor Clone (Fixed Save & Clean Code)")
+        self.setWindowTitle("Cursor Clone (Autonomous Agent)")
         self.resize(1400, 900)
         self.current_project_path = None
         self.rag_engine = ProjectIndexer(API_KEY)
-        self.indexer_thread = None
+        self.agent_worker = None
 
-        # Layout setup
+        # --- Layout ---
         self.v_split = QSplitter(Qt.Orientation.Vertical);
         self.setCentralWidget(self.v_split)
         self.top_split = QSplitter(Qt.Orientation.Horizontal);
         self.v_split.addWidget(self.top_split)
 
         # 1. Files
-        self._setup_file_explorer()
-        # 2. Tabs
+        self.fmodel = QFileSystemModel();
+        self.fmodel.setRootPath(QDir.rootPath())
+        self.tree = QTreeView();
+        self.tree.setModel(self.fmodel);
+        self.tree.setHeaderHidden(True)
+        for i in range(1, 4): self.tree.setColumnHidden(i, True)
+        self.tree.doubleClicked.connect(self.open_file)
+        self.top_split.addWidget(self.tree)
+
+        # 2. Tabs (Code)
         self.tabs = QTabWidget();
         self.tabs.setTabsClosable(True);
         self.tabs.setDocumentMode(True)
-        self.tabs.tabCloseRequested.connect(self.close_tab)
+        self.tabs.tabCloseRequested.connect(lambda i: self.tabs.removeTab(i))
         self.top_split.addWidget(self.tabs)
+
         # 3. Chat
-        self._setup_chat_panel()
+        chat_w = QWidget();
+        cl = QVBoxLayout(chat_w);
+        cl.setContentsMargins(5, 5, 5, 5)
+        self.chat_out = QTextBrowser();
+        self.chat_out.setOpenLinks(False)
+        self.chat_out.anchorClicked.connect(self.on_chat_link_clicked)
+        cl.addWidget(self.chat_out)
+
+        self.chat_in = QLineEdit();
+        self.chat_in.setPlaceholderText("Agent instruction (e.g. 'Create a Tetris game')...")
+        self.chat_in.returnPressed.connect(self.start_agent)
+        cl.addWidget(self.chat_in)
+
+        self.top_split.addWidget(chat_w)
         self.top_split.setSizes([250, 800, 400])
 
         # 4. Terminal
-        self.terminal = TerminalPanel();
-        self.v_split.addWidget(self.terminal)
+        self.term = TerminalPanel();
+        self.v_split.addWidget(self.term)
         self.v_split.setSizes([800, 200])
 
-        self._create_menu()
-
-        # Горячая клавиша Ctrl+S для сохранения
-        self.save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
-        self.save_shortcut.activated.connect(self.save_current_file)
-
-        self.setStyleSheet("QMainWindow, QWidget { background-color: #252526; color: #ccc; }")
-        self._set_tree_root(os.getcwd())
-
-    def _setup_file_explorer(self):
-        self.file_model = QFileSystemModel()
-        self.file_model.setFilter(QDir.Filter.NoDotAndDotDot | QDir.Filter.AllDirs | QDir.Filter.Files)
-        self.file_model.setRootPath(QDir.rootPath())
-        self.tree_view = QTreeView();
-        self.tree_view.setModel(self.file_model)
-        self.tree_view.setHeaderHidden(True)
-        for i in range(1, 4): self.tree_view.setColumnHidden(i, True)
-        self.tree_view.doubleClicked.connect(self.on_file_double_clicked)
-        self.top_split.addWidget(self.tree_view)
-
-    def _setup_chat_panel(self):
-        w = QWidget();
-        l = QVBoxLayout(w);
-        l.setContentsMargins(5, 5, 5, 5)
-        self.status_label = QLabel("Ready");
-        l.addWidget(self.status_label)
-        self.chat_history = QTextBrowser();
-        self.chat_history.setOpenLinks(False)
-        self.chat_history.anchorClicked.connect(self.on_chat_link_clicked)
-        l.addWidget(self.chat_history)
-        self.chat_input = QLineEdit();
-        self.chat_input.setPlaceholderText("Ask AI...")
-        self.chat_input.returnPressed.connect(self.send_chat_message)
-        l.addWidget(self.chat_input)
-        self.completer = QCompleter(self);
-        self.completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
-        self.completer_model = QStringListModel([], self.completer)
-        self.completer.setModel(self.completer_model);
-        self.chat_input.setCompleter(self.completer)
-        self.chat_input.textEdited.connect(self.check_at_symbol)
-        self.top_split.addWidget(w)
-
-    def _create_menu(self):
+        # Menu (ИСПРАВЛЕНО!)
         m = self.menuBar().addMenu("&File")
 
-        # Save Action
-        save_act = QAction("Save", self)
-        save_act.setShortcut("Ctrl+S")
-        save_act.triggered.connect(self.save_current_file)
-        m.addAction(save_act)
+        # Open
+        open_action = QAction("Open Project...", self)
+        open_action.triggered.connect(self.open_folder)
+        m.addAction(open_action)
 
-        op = QAction("Open Project...", self)
-        op.triggered.connect(self.open_folder_dialog)
-        m.addAction(op)
+        # Save
+        save_action = QAction("Save", self)
+        save_action.setShortcut("Ctrl+S")
+        save_action.triggered.connect(self.save_file)
+        m.addAction(save_action)
 
-    # --- SAVE FUNCTION ---
-    def save_current_file(self):
-        """Сохраняет текущий открытый файл."""
-        editor = self.tabs.currentWidget()
-        if not editor: return
-
-        # Путь к файлу хранится в подсказке вкладки
-        file_path = self.tabs.tabToolTip(self.tabs.currentIndex())
-
-        if file_path and os.path.exists(os.path.dirname(file_path)):
-            try:
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(editor.text())
-                self.status_label.setText(f"Saved: {os.path.basename(file_path)}")
-                # Мигаем цветом в консоли (опционально)
-                self.chat_history.append(f"<small style='color:gray'>File saved: {os.path.basename(file_path)}</small>")
-            except Exception as e:
-                QMessageBox.warning(self, "Error", f"Could not save: {e}")
+        self.setStyleSheet("""
+            QMainWindow, QWidget { background-color: #252526; color: #ccc; }
+            QTextBrowser { font-family: 'Segoe UI', sans-serif; font-size: 13px; }
+            QTreeView { border: none; background: #252526; }
+            QLineEdit { background: #3c3c3c; border: 1px solid #555; padding: 5px; color: white; }
+        """)
+        self.tree.setRootIndex(self.fmodel.index(os.getcwd()))
 
     # --- LOGIC ---
-    def open_folder_dialog(self):
+
+    def open_folder(self):
         f = QFileDialog.getExistingDirectory(self, "Open Project")
-        if f: self.open_project(f)
+        if f:
+            self.current_project_path = f
+            self.setWindowTitle(f"Agent - {os.path.basename(f)}")
+            self.tree.setRootIndex(self.fmodel.index(f))
+            self.term.set_cwd(f)
+            # Запуск индексации при открытии
+            self.idx_worker = IndexerWorker(self.rag_engine, f)
+            self.idx_worker.start()
 
-    def open_project(self, folder):
-        self.current_project_path = folder
-        self.setWindowTitle(f"Cursor Clone - {os.path.basename(folder)}")
-        self._set_tree_root(folder)
-        self.start_background_indexing(folder)
-        self.terminal.set_working_directory(folder)
-
-    def _set_tree_root(self, path):
-        self.tree_view.setRootIndex(self.file_model.index(path))
-
-    def send_chat_message(self):
-        text = self.chat_input.text().strip()
+    def start_agent(self):
+        text = self.chat_in.text().strip()
         if not text: return
-        self.append_chat_msg("You", text, True)
-        self.chat_input.clear()
-        self.status_label.setText("Thinking...")
-        QApplication.processEvents()
+        if not self.current_project_path:
+            QMessageBox.warning(self, "Error", "Open a project folder first!")
+            return
 
-        rag = []
-        if self.rag_engine.is_indexed: rag = self.rag_engine.search(text)
+        self.chat_in.clear()
+        # Отображаем вопрос
+        self.chat_out.append(
+            f"<div style='text-align:right; margin:10px;'><span style='background:#0e639c; color:white; padding:8px; border-radius:10px;'>{text}</span></div>")
 
-        # <-- ИЗМЕНЕНИЕ ЗДЕСЬ:
-        active_file_data = self.get_active_file_info()
-        # Передаем кортеж (имя, код) в prompt builder
-        prompt = build_context_prompt(text, {}, active_file_data, rag)
+        # Блокируем ввод
+        self.chat_in.setEnabled(False)
+        self.chat_in.setPlaceholderText("Agent is working... Please wait.")
 
-        resp = get_chat_response(prompt)
-        self.process_ai_response(resp)
-        self.status_label.setText("Ready")
+        # ЗАПУСК АГЕНТА
+        # Передаем rag_engine, чтобы агент мог видеть код
+        self.agent_worker = AgentWorker(text, self.current_project_path, self.rag_engine)
+        self.agent_worker.log_signal.connect(self.append_html)
+        self.agent_worker.finished_signal.connect(self.on_agent_done)
+        self.agent_worker.start()
 
-    def process_ai_response(self, text):
-        pattern = re.compile(r"### FILE: (.*?)\n(.*?)### END_FILE", re.DOTALL)
-        files_created = []
+    def on_agent_done(self):
+        self.chat_in.setEnabled(True)
+        self.chat_in.setPlaceholderText("Agent instruction...")
+        self.chat_in.setFocus()
+        # После завершения работы агента полезно переиндексировать новые файлы
+        self.idx_worker = IndexerWorker(self.rag_engine, self.current_project_path)
+        self.idx_worker.start()
 
-        def repl(m):
-            fn = m.group(1).strip()
-            content = m.group(2)
-
-            # === ГЛАВНОЕ ИСПРАВЛЕНИЕ: ЧИСТКА КОДА ===
-            # Удаляем ```python, ```, ```bash и т.д.
-            content = content.replace("```python", "").replace("```bash", "").replace("```", "").strip()
-
-            if self.current_project_path:
-                try:
-                    full_p = os.path.join(self.current_project_path, fn)
-                    with open(full_p, 'w', encoding='utf-8') as f:
-                        f.write(content)
-                    files_created.append(fn)
-                    return f'<br><div style="color:#4ec9b0; font-weight:bold">✅ Created: <a href="{fn}" style="color:#4ec9b0">{fn}</a></div><br>'
-                except Exception as e:
-                    return str(e)
-            return "[Error: Open folder first]"
-
-        new_text = re.sub(pattern, repl, text)
-        self.append_chat_msg("AI", new_text, False)
-        if files_created:
-            self.status_label.setText("Re-indexing...")
-            self.start_background_indexing(self.current_project_path)
-
-    def append_chat_msg(self, role, text, is_user):
-        c = "#569cd6" if is_user else "#ce9178"
-        text = text.replace("```", "<hr>").replace("\n", "<br>")
-        self.chat_history.append(f"<div><b style='color:{c}'>{role}:</b><br>{text}</div><hr>")
-        sb = self.chat_history.verticalScrollBar();
+    def append_html(self, html):
+        self.chat_out.append(html)
+        sb = self.chat_out.verticalScrollBar();
         sb.setValue(sb.maximum())
 
+    def open_file(self, idx):
+        p = self.fmodel.filePath(idx)
+        if not os.path.isdir(p):
+            self.add_tab(p)
+
     def on_chat_link_clicked(self, url):
-        if self.current_project_path: self.add_file_tab(os.path.join(self.current_project_path, url.toString()))
+        # Для кликов по ссылкам файлов в будущем (сейчас просто текст)
+        pass
 
-    def start_background_indexing(self, folder):
-        if self.indexer_thread: self.indexer_thread.terminate()
-        self.indexer_thread = IndexerWorker(self.rag_engine, folder)
-        self.indexer_thread.progress_signal.connect(lambda m: self.status_label.setText(m))
-        self.indexer_thread.start()
-
-    def on_file_double_clicked(self, idx):
-        p = self.file_model.filePath(idx)
-        if not os.path.isdir(p): self.add_file_tab(p)
-
-    def add_file_tab(self, path):
+    def add_tab(self, path):
+        # Проверка дубликатов
         for i in range(self.tabs.count()):
-            if self.tabs.tabToolTip(i) == path: self.tabs.setCurrentIndex(i); return
+            if self.tabs.tabToolTip(i) == path:
+                self.tabs.setCurrentIndex(i)
+                return
+
         ed = CodeEditor();
         ed.set_lexer_by_filename(path)
         try:
@@ -318,22 +382,20 @@ class AIEditorWindow(QMainWindow):
         except:
             pass
 
-    def close_tab(self, i):
-        self.tabs.removeTab(i)
+    def save_file(self):
+        ed = self.tabs.currentWidget()
+        if ed:
+            p = self.tabs.tabToolTip(self.tabs.currentIndex())
+            with open(p, 'w', encoding='utf-8') as f: f.write(ed.text())
+            self.chat_out.append(f"<small style='color:gray'>Saved: {os.path.basename(p)}</small>")
 
     def get_active_file_info(self):
-        """Возвращает (имя_файла, код)"""
-        widget = self.tabs.currentWidget()
-        if widget:
-            # Получаем полный путь из подсказки
-            full_path = self.tabs.tabToolTip(self.tabs.currentIndex())
-            # Берем только имя файла (например snake_game.py)
-            filename = os.path.basename(full_path) if full_path else "untitled.py"
-            return (filename, widget.text())
-        return ("None", "")
-
-    def check_at_symbol(self, t):
-        if t.endswith("@"): self.completer.complete()
+        """Возвращает (имя, код) текущего файла. Используется для обычного чата."""
+        w = self.tabs.currentWidget()
+        if w:
+            fp = self.tabs.tabToolTip(self.tabs.currentIndex())
+            return (os.path.basename(fp), w.text())
+        return None
 
 
 if __name__ == '__main__':
