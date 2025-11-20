@@ -24,7 +24,26 @@ class ProjectIndexer:
         self.embeddings = []
         self.is_indexed = False
 
-        extensions = {'.py', '.js', '.ts', '.html', '.css', '.java', '.cpp', '.h', '.c', '.cs', '.json', '.md', '.txt'}
+        extensions = {
+            # Python & Backend
+            '.py', '.pyw',
+            # Web & React (JS/TS)
+            '.js', '.jsx', '.ts', '.tsx', '.vue', '.svelte',
+            '.html', '.css', '.scss', '.less',
+            # Android & Mobile
+            '.java', '.kt', '.kts', '.xml', '.gradle', '.properties',
+            '.dart', '.swift',
+            # C/C++/C#
+            '.c', '.cpp', '.h', '.hpp', '.cs',
+            # Config & Data
+            '.json', '.yaml', '.yml', '.toml', '.ini', '.env.example',
+            # Docs
+            '.md', '.txt', '.rst',
+            # Scripts
+            '.sh', '.bat', '.ps1',
+            # Other common langs
+            '.go', '.rs', '.php', '.rb', '.lua'
+        }
 
         if progress_callback: progress_callback("Scanning files...")
 
